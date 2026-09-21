@@ -1,0 +1,17 @@
+# Tested with Python 3.11 and Pipecat 1.10.0.
+
+# Realtime voice pipeline: Deepgram STT/TTS, Groq LLM, laptop audio, Silero VAD.
+pipecat-ai[deepgram,groq,local,silero]==1.10.0
+
+# Stateful booking workflow.
+langgraph==1.2.11
+
+# Google Calendar and Google Sheets OAuth/API clients.
+google-api-python-client==2.200.0
+google-auth==2.58.0
+google-auth-oauthlib==1.4.1
+
+# Direct application imports and Windows IANA timezone support.
+python-dotenv==1.2.3
+loguru==0.7.3
+tzdata==2026.4
