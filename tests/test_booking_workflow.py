@@ -16,6 +16,53 @@ workflow = importlib.import_module("agent.graph")
 
 
 class BookingWorkflowCallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_model_cannot_supply_an_unspoken_day_part(self):
+        callback = AsyncMock()
+        params = SimpleNamespace(result_callback=callback, llm=SimpleNamespace(push_frame=AsyncMock()))
+        session = SimpleNamespace(advance=AsyncMock(return_value={
+            "status": "needs_input",
+            "spoken_response": "What works better for you: morning, afternoon, or evening?",
+        }))
+
+        with (
+            patch.object(main, "booking_session", session),
+            patch.object(main.transcription_printer, "latest_text", "What about tomorrow?"),
+        ):
+            await main.booking_workflow(
+                params,
+                meeting_date="2026-09-23",
+                time_preference="afternoon",
+            )
+
+        self.assertEqual(session.advance.await_args.kwargs["time_preference"], "")
+
+    async def test_ambiguous_spoken_email_is_confirmed_before_booking(self):
+        callback = AsyncMock()
+        params = SimpleNamespace(result_callback=callback, llm=SimpleNamespace(push_frame=AsyncMock()))
+        session = SimpleNamespace(advance=AsyncMock(return_value={
+            "status": "needs_input",
+            "spoken_response": "Thanks. What's the best email address for the booking?",
+        }))
+
+        with (
+            patch.object(main, "booking_session", session),
+            patch.object(
+                main.transcription_printer,
+                "latest_text",
+                "My name is Ali Juan, and the email is ali con at g mail dot com.",
+            ),
+        ):
+            await main.booking_workflow(params, name="Ali Juan", email="ali@gmail.com")
+
+        self.assertEqual(session.advance.await_count, 1)
+        self.assertEqual(session.advance.await_args.kwargs["email"], "")
+        result = callback.await_args.args[0]
+        self.assertEqual(result["spoken_response"], "I heard ali at gmail dot com. Is that correct?")
+
+    async def test_tts_filter_removes_visual_quotes_and_markdown(self):
+        filtered = await main.SpokenTextFilter().filter('She said "**Agentix Labs AI**".')
+        self.assertEqual(filtered, "She said Agentix Labs AI.")
+
     async def test_completed_booking_emits_one_exact_llm_tts_response(self):
         date = (datetime.now(ZoneInfo("Asia/Karachi")) + timedelta(days=1)).strftime("%Y-%m-%d")
         callback = AsyncMock()
@@ -66,6 +113,12 @@ class BookingWorkflowCallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             main.llm._settings.extra["extra_body"]["reasoning_format"],
             "hidden",
+        )
+
+    def test_flux_boosts_company_specific_spoken_terms(self):
+        self.assertEqual(
+            main.stt._settings.keyterm,
+            ["Agentix Labs AI", "PongVerse", "LangGraph", "DeepSORT"],
         )
 
 

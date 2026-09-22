@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -32,6 +33,7 @@ from pipecat.services.deepgram.flux.stt import DeepgramFluxSTTService
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.turns.user_mute import FunctionCallUserMuteStrategy
+from pipecat.utils.text.base_text_filter import BaseTextFilter
 
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
@@ -40,6 +42,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
 )
 from agent.booking_session import BookingSession
 from pipecat.adapters.schemas.direct_function import tool_options
+from rag.integration import RAGContextProcessor
 
 
 logger.remove()
@@ -56,11 +59,47 @@ stt = DeepgramFluxSTTService(
         model="flux-general-en",
         min_confidence=0.3,
         eot_threshold=0.8,
+        keyterm=["Agentix Labs AI", "PongVerse", "LangGraph", "DeepSORT"],
     ),
 )
 
 # One process / local microphone conversation is one caller session.
 booking_session = BookingSession()
+
+_DAY_PARTS = ("morning", "afternoon", "evening")
+
+
+def _latest_caller_text():
+    printer = globals().get("transcription_printer")
+    return getattr(printer, "latest_text", "")
+
+
+def _caller_supported_time_preference(preference: str, caller_text: str) -> str:
+    """Reject a model-invented day-part while preserving caller-supplied preferences."""
+    preference_lower = preference.lower()
+    caller_lower = caller_text.lower()
+    stated_parts = [part for part in _DAY_PARTS if part in preference_lower]
+    if stated_parts and not any(part in caller_lower for part in stated_parts):
+        return ""
+    return preference
+
+
+def _spoken_email_is_ambiguous(email: str, caller_text: str) -> bool:
+    """Detect extra words in the spoken local-part that the normalized email dropped."""
+    normalized = caller_text.lower().replace("@", " at ")
+    if " at " not in normalized or "@" not in email:
+        return False
+    email_segment = re.split(r"\bemail(?:\s+address)?\b", normalized)[-1]
+    spoken_local = email_segment.split(" at ", 1)[0]
+    words = re.findall(r"[a-z0-9]+", spoken_local)
+    fillers = {"is", "its", "it", "s", "my", "the", "address", "please"}
+    spoken_compact = "".join(word for word in words if word not in fillers)
+    expected_compact = re.sub(r"[^a-z0-9]", "", email.split("@", 1)[0].lower())
+    return bool(spoken_compact and spoken_compact != expected_compact)
+
+
+def _say_email(email: str) -> str:
+    return email.replace("@", " at ").replace(".", " dot ")
 
 
 @tool_options(cancel_on_interruption=True, timeout_secs=120)
@@ -82,10 +121,20 @@ async def booking_workflow(
         time_preference: Caller preference such as morning, afternoon, evening,
             after 3 PM, before lunch, or around 5 PM; otherwise empty.
     """
+    caller_text = _latest_caller_text()
+    time_preference = _caller_supported_time_preference(time_preference, caller_text)
+    ambiguous_email = bool(email and _spoken_email_is_ambiguous(email, caller_text))
     result = await booking_session.advance(
-        meeting_date=meeting_date, meeting_time=meeting_time, name=name, email=email,
+        meeting_date=meeting_date,
+        meeting_time=meeting_time,
+        name=name,
+        email="" if ambiguous_email else email,
         time_preference=time_preference,
     )
+    if ambiguous_email:
+        # Preserve all other booking progress, but do not write an uncertain address.
+        result = dict(result)
+        result["spoken_response"] = f"I heard {_say_email(email)}. Is that correct?"
     async def emit_spoken_response():
         # The workflow has already produced the exact public response. Emit it
         # through the existing LLM-frame -> TTS path without another provider
@@ -128,11 +177,18 @@ llm = GroqLLMService(
     ),
 )
 
+class SpokenTextFilter(BaseTextFilter):
+    async def filter(self, text: str) -> str:
+        # Quotes and Markdown emphasis are visual punctuation and should not be spoken.
+        return text.translate(str.maketrans("", "", '"“”*`'))
+
+
 tts = DeepgramTTSService(
     api_key=os.getenv("DEEPGRAM_API_KEY"),
     settings=DeepgramTTSService.Settings(
         voice="aura-2-thalia-en",
     ),
+    text_filters=[SpokenTextFilter()],
 )
 
 transport = LocalAudioTransport(
@@ -159,6 +215,8 @@ user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
     ),
 )
 
+rag_context = RAGContextProcessor()
+
 class LLMPrintProcessor(FrameProcessor):
     async def process_frame(self, frame: Frame, direction):
         await super().process_frame(frame, direction)
@@ -172,20 +230,28 @@ class LLMPrintProcessor(FrameProcessor):
         await self.push_frame(frame, direction)
 
 class TranscriptionPrinter(FrameProcessor):
+    def __init__(self):
+        super().__init__()
+        self.latest_text = ""
+
     async def process_frame(self, frame: Frame, direction):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, TranscriptionFrame):
+            self.latest_text = frame.text
             print(f"You: {frame.text}")
 
         await self.push_frame(frame, direction)
 
 
+transcription_printer = TranscriptionPrinter()
+
 pipeline = Pipeline([
     transport.input(),
     stt,
-    TranscriptionPrinter(),
+    transcription_printer,
     user_aggregator,
+    rag_context,
     llm,
     LLMPrintProcessor(),
     tts,
