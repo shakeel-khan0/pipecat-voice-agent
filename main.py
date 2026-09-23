@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+from time import perf_counter
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -23,7 +24,7 @@ from pipecat.transports.local.audio import (
     LocalAudioTransportParams,
 )
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.worker import PipelineWorker
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.workers.runner import WorkerRunner
 
 from pipecat.services.groq.llm import GroqLLMService
@@ -43,6 +44,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
 from agent.booking_session import BookingSession
 from pipecat.adapters.schemas.direct_function import tool_options
 from rag.integration import RAGContextProcessor
+from trace_recorder import TraceMetricsObserver, trace_recorder
 
 
 logger.remove()
@@ -65,6 +67,8 @@ stt = DeepgramFluxSTTService(
 
 # One process / local microphone conversation is one caller session.
 booking_session = BookingSession()
+_pending_email = ""
+_pending_email_turn = 0
 
 _DAY_PARTS = ("morning", "afternoon", "evening")
 
@@ -72,6 +76,11 @@ _DAY_PARTS = ("morning", "afternoon", "evening")
 def _latest_caller_text():
     printer = globals().get("transcription_printer")
     return getattr(printer, "latest_text", "")
+
+
+def _latest_caller_turn():
+    printer = globals().get("transcription_printer")
+    return getattr(printer, "turn_id", 0)
 
 
 def _caller_supported_time_preference(preference: str, caller_text: str) -> str:
@@ -84,22 +93,28 @@ def _caller_supported_time_preference(preference: str, caller_text: str) -> str:
     return preference
 
 
-def _spoken_email_is_ambiguous(email: str, caller_text: str) -> bool:
-    """Detect extra words in the spoken local-part that the normalized email dropped."""
-    normalized = caller_text.lower().replace("@", " at ")
-    if " at " not in normalized or "@" not in email:
-        return False
-    email_segment = re.split(r"\bemail(?:\s+address)?\b", normalized)[-1]
-    spoken_local = email_segment.split(" at ", 1)[0]
-    words = re.findall(r"[a-z0-9]+", spoken_local)
-    fillers = {"is", "its", "it", "s", "my", "the", "address", "please"}
-    spoken_compact = "".join(word for word in words if word not in fillers)
-    expected_compact = re.sub(r"[^a-z0-9]", "", email.split("@", 1)[0].lower())
-    return bool(spoken_compact and spoken_compact != expected_compact)
-
-
 def _say_email(email: str) -> str:
     return email.replace("@", " at ").replace(".", " dot ")
+
+
+def _email_requires_confirmation(email: str, caller_text: str, caller_turn: int) -> bool:
+    """Require approval from a later caller turn before accepting an email."""
+    global _pending_email, _pending_email_turn
+
+    normalized_email = email.strip().lower()
+    affirmative = bool(re.search(r"\b(?:yes|correct|right|confirmed|that's right|that is right)\b", caller_text, re.IGNORECASE))
+    if (
+        _pending_email == normalized_email
+        and caller_turn > _pending_email_turn
+        and affirmative
+    ):
+        _pending_email = ""
+        _pending_email_turn = 0
+        return False
+
+    _pending_email = normalized_email
+    _pending_email_turn = caller_turn
+    return True
 
 
 @tool_options(cancel_on_interruption=True, timeout_secs=120)
@@ -117,24 +132,60 @@ async def booking_workflow(
         meeting_date: Caller-provided date in YYYY-MM-DD, otherwise empty.
         meeting_time: Caller-selected time in HH:MM AM/PM, otherwise empty.
         name: Caller-provided name, otherwise empty.
-        email: Caller-provided email address, otherwise empty.
+        email: Caller-provided email address, otherwise empty. On the first email
+            turn, call this tool immediately so it can ask for confirmation. After
+            the caller confirms on their next turn, pass the same email again.
         time_preference: Caller preference such as morning, afternoon, evening,
             after 3 PM, before lunch, or around 5 PM; otherwise empty.
     """
+    started = perf_counter()
+    trace_recorder.record(
+        "tool_call",
+        tool="booking_workflow",
+        arguments={
+            "meeting_date": meeting_date,
+            "meeting_time": meeting_time,
+            "name": name,
+            "email": email,
+            "time_preference": time_preference,
+        },
+        timeout_seconds=120,
+        application_retries=0,
+    )
     caller_text = _latest_caller_text()
+    caller_turn = _latest_caller_turn()
     time_preference = _caller_supported_time_preference(time_preference, caller_text)
-    ambiguous_email = bool(email and _spoken_email_is_ambiguous(email, caller_text))
+    confirm_email = bool(
+        email
+        and caller_turn > 0
+        and _email_requires_confirmation(email, caller_text, caller_turn)
+    )
     result = await booking_session.advance(
         meeting_date=meeting_date,
         meeting_time=meeting_time,
         name=name,
-        email="" if ambiguous_email else email,
+        email="" if confirm_email else email,
         time_preference=time_preference,
     )
-    if ambiguous_email:
+    if confirm_email:
         # Preserve all other booking progress, but do not write an uncertain address.
         result = dict(result)
         result["spoken_response"] = f"I heard {_say_email(email)}. Is that correct?"
+    trace_recorder.record(
+        "tool_result",
+        tool="booking_workflow",
+        duration_ms=round((perf_counter() - started) * 1000, 3),
+        result={
+            "status": result.get("status"),
+            "booking_confirmed": result.get("booking_confirmed"),
+            "lead_saved": result.get("lead_saved"),
+            "spoken_response": result.get("spoken_response"),
+            "offered_slots": result.get("offered_slots"),
+        },
+        error_type=None if result.get("status") != "error" else "BookingWorkflowError",
+    )
+    if result.get("status") == "completed":
+        trace_recorder.finalize_after_speech()
     async def emit_spoken_response():
         # The workflow has already produced the exact public response. Emit it
         # through the existing LLM-frame -> TTS path without another provider
@@ -221,10 +272,15 @@ class LLMPrintProcessor(FrameProcessor):
     async def process_frame(self, frame: Frame, direction):
         await super().process_frame(frame, direction)
 
+        if isinstance(frame, LLMFullResponseStartFrame):
+            trace_recorder.start_assistant_response()
+
         if isinstance(frame, TextFrame):
+            trace_recorder.assistant_text(frame.text)
             print(frame.text, end="", flush=True)
 
         if isinstance(frame, LLMFullResponseEndFrame):
+            trace_recorder.end_assistant_response()
             print()
 
         await self.push_frame(frame, direction)
@@ -233,12 +289,15 @@ class TranscriptionPrinter(FrameProcessor):
     def __init__(self):
         super().__init__()
         self.latest_text = ""
+        self.turn_id = 0
 
     async def process_frame(self, frame: Frame, direction):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, TranscriptionFrame):
             self.latest_text = frame.text
+            self.turn_id += 1
+            trace_recorder.user_turn(frame.text)
             print(f"You: {frame.text}")
 
         await self.push_frame(frame, direction)
@@ -259,7 +318,11 @@ pipeline = Pipeline([
     assistant_aggregator,
 ])
 
-worker = PipelineWorker(pipeline)
+worker = PipelineWorker(
+    pipeline,
+    params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
+    observers=[TraceMetricsObserver(trace_recorder)],
+)
 
 
 async def main():

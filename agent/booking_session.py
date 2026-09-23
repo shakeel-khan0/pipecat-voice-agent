@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 from langgraph.types import Command
 
 from agent.graph import graph, initial_state
+from trace_recorder import trace_recorder
 
 
 _TIME_WORDS = {
@@ -164,7 +165,13 @@ class BookingSession:
                         self._slot_was_taken = True
                     self._details.pop("meeting_time", None)
                 return self._response()
-            except Exception:
+            except Exception as exc:
+                trace_recorder.record(
+                    "error",
+                    component="booking_session",
+                    error_type=type(exc).__name__,
+                    application_retries=0,
+                )
                 # Do not replay a write whose remote outcome might be unknown.
                 snapshot = await self.graph.aget_state(self.config)
                 self._failure = {

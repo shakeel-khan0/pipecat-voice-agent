@@ -1,11 +1,13 @@
 import os
 from datetime import datetime
+from time import perf_counter
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from loguru import logger
 
 from services.google_auth import get_sheets_service
+from trace_recorder import trace_recorder
 
 
 load_dotenv()
@@ -35,13 +37,37 @@ def save_lead(
     meeting_date: str,
     meeting_time: str,
 ):
+    started = perf_counter()
     if not SPREADSHEET_ID:
+        trace_recorder.record(
+            "external_operation",
+            service="google_sheets",
+            operation="values.append",
+            duration_ms=round((perf_counter() - started) * 1000, 3),
+            success=False,
+            range=TARGET_RANGE,
+            error_type="ConfigurationError",
+            application_retries=0,
+        )
         return {
             "success": False,
             "error": "GOOGLE_SHEET_ID is not configured.",
         }
 
-    service = get_sheets_service()
+    try:
+        service = get_sheets_service()
+    except Exception as exc:
+        trace_recorder.record(
+            "external_operation",
+            service="google_sheets",
+            operation="values.append",
+            duration_ms=round((perf_counter() - started) * 1000, 3),
+            success=False,
+            range=TARGET_RANGE,
+            error_type=type(exc).__name__,
+            application_retries=0,
+        )
+        raise
 
     timestamp = datetime.now(
         ZoneInfo("Asia/Karachi")
@@ -67,15 +93,28 @@ def save_lead(
         TARGET_RANGE,
     )
 
-    result = service.spreadsheets().values().append(
-        spreadsheetId=SPREADSHEET_ID,
-        range=TARGET_RANGE,
-        valueInputOption="USER_ENTERED",
-        insertDataOption="INSERT_ROWS",
-        includeValuesInResponse=True,
-        responseValueRenderOption="UNFORMATTED_VALUE",
-        body={"values": row},
-    ).execute()
+    try:
+        result = service.spreadsheets().values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range=TARGET_RANGE,
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            includeValuesInResponse=True,
+            responseValueRenderOption="UNFORMATTED_VALUE",
+            body={"values": row},
+        ).execute()
+    except Exception as exc:
+        trace_recorder.record(
+            "external_operation",
+            service="google_sheets",
+            operation="values.append",
+            duration_ms=round((perf_counter() - started) * 1000, 3),
+            success=False,
+            range=TARGET_RANGE,
+            error_type=type(exc).__name__,
+            application_retries=0,
+        )
+        raise
 
     updates = result.get("updates") or {}
     updated_range = updates.get("updatedRange")
@@ -103,6 +142,18 @@ def save_lead(
 
     if not write_confirmed:
         logger.error("Google Sheets API did not confirm a complete lead row write.")
+        trace_recorder.record(
+            "external_operation",
+            service="google_sheets",
+            operation="values.append",
+            duration_ms=round((perf_counter() - started) * 1000, 3),
+            success=False,
+            range=TARGET_RANGE,
+            updated_rows=updated_rows,
+            updated_cells=updated_cells,
+            error_type="WriteNotConfirmed",
+            application_retries=0,
+        )
         return {
             "success": False,
             "error": "Google Sheets did not confirm that the lead row was written.",
@@ -111,6 +162,17 @@ def save_lead(
             "updated_cells": updated_cells,
         }
 
+    trace_recorder.record(
+        "external_operation",
+        service="google_sheets",
+        operation="values.append",
+        duration_ms=round((perf_counter() - started) * 1000, 3),
+        success=True,
+        range=TARGET_RANGE,
+        updated_rows=updated_rows,
+        updated_cells=updated_cells,
+        application_retries=0,
+    )
     return {
         "success": True,
         "updated_range": updated_range,

@@ -11,6 +11,7 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameProcessor
 
 from rag.retrieve import HybridRetriever, RetrievalResult
+from trace_recorder import trace_recorder
 
 
 _SMALL_TALK = re.compile(
@@ -414,18 +415,27 @@ class RAGContextProcessor(FrameProcessor):
         hint, ambiguous = entity_hint(query, recent_user_queries)
         if not needs_rag(query, recent_user_queries):
             print("RAG: skipped")
+            trace_recorder.rag_event(used=False)
             await self.push_frame(frame, direction)
             return
 
         started = time.perf_counter()
+        retrieval_error = None
         try:
             retriever = await self._get_retriever()
             search_query = retrieval_query(query, hint=hint, ambiguous=ambiguous)
             results, latency_ms = await asyncio.to_thread(retriever.search, search_query)
-        except Exception:
+        except Exception as exc:
             latency_ms = (time.perf_counter() - started) * 1000
             results = []
+            retrieval_error = exc
         selected = select_results(query, results, hint=hint)
         self._cached_instruction = temporary_instruction(selected, hint=hint, query=query)
         print(f"RAG: {len(selected)} chunks | {latency_ms:.2f} ms")
+        trace_recorder.rag_event(
+            used=True,
+            latency_ms=latency_ms,
+            results=selected,
+            error=retrieval_error,
+        )
         await self.push_frame(self._temporary_frame(frame, self._cached_instruction), direction)

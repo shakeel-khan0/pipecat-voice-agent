@@ -179,6 +179,10 @@ confirm it before executing the booking.
 
 Never guess.
 Never silently correct contact information.
+For every newly provided email, call `booking_workflow` immediately with the
+normalized address and speak only its confirmation question. Never confirm the
+address yourself. Wait for a new caller turn. After the caller says yes, call
+`booking_workflow` again with the same address.
 
 
 ## Tool results

@@ -16,6 +16,12 @@ workflow = importlib.import_module("agent.graph")
 
 
 class BookingWorkflowCallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        main._pending_email = ""
+        main._pending_email_turn = 0
+        main.transcription_printer.latest_text = ""
+        main.transcription_printer.turn_id = 0
+
     async def test_model_cannot_supply_an_unspoken_day_part(self):
         callback = AsyncMock()
         params = SimpleNamespace(result_callback=callback, llm=SimpleNamespace(push_frame=AsyncMock()))
@@ -51,6 +57,7 @@ class BookingWorkflowCallbackTests(unittest.IsolatedAsyncioTestCase):
                 "latest_text",
                 "My name is Ali Juan, and the email is ali con at g mail dot com.",
             ),
+            patch.object(main.transcription_printer, "turn_id", 4),
         ):
             await main.booking_workflow(params, name="Ali Juan", email="ali@gmail.com")
 
@@ -58,6 +65,29 @@ class BookingWorkflowCallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.advance.await_args.kwargs["email"], "")
         result = callback.await_args.args[0]
         self.assertEqual(result["spoken_response"], "I heard ali at gmail dot com. Is that correct?")
+
+    async def test_email_cannot_be_self_confirmed_in_the_same_caller_turn(self):
+        session = SimpleNamespace(advance=AsyncMock(return_value={
+            "status": "needs_input",
+            "spoken_response": "Thanks. What's the best email address for the booking?",
+        }))
+
+        async def invoke():
+            params = SimpleNamespace(result_callback=AsyncMock(), llm=SimpleNamespace(push_frame=AsyncMock()))
+            await main.booking_workflow(params, name="Test Caller", email="tester@gmail.com")
+
+        with patch.object(main, "booking_session", session):
+            main.transcription_printer.latest_text = "My email is tester at gmail dot com."
+            main.transcription_printer.turn_id = 7
+            await invoke()
+            await invoke()
+            self.assertEqual(session.advance.await_args_list[0].kwargs["email"], "")
+            self.assertEqual(session.advance.await_args_list[1].kwargs["email"], "")
+
+            main.transcription_printer.latest_text = "Yes, that is correct."
+            main.transcription_printer.turn_id = 8
+            await invoke()
+            self.assertEqual(session.advance.await_args_list[2].kwargs["email"], "tester@gmail.com")
 
     async def test_tts_filter_removes_visual_quotes_and_markdown(self):
         filtered = await main.SpokenTextFilter().filter('She said "**Agentix Labs AI**".')
@@ -120,6 +150,10 @@ class BookingWorkflowCallbackTests(unittest.IsolatedAsyncioTestCase):
             main.stt._settings.keyterm,
             ["Agentix Labs AI", "PongVerse", "LangGraph", "DeepSORT"],
         )
+
+    def test_representative_trace_metrics_are_enabled(self):
+        self.assertTrue(main.worker._params.enable_metrics)
+        self.assertTrue(main.worker._params.enable_usage_metrics)
 
 
 if __name__ == "__main__":
