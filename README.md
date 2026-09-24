@@ -19,6 +19,8 @@ A real-time local-microphone AI receptionist built with Pipecat 1.10 and LangGra
 
 ## Runtime architecture
 
+See [docs/architecture.md](docs/architecture.md) for the detailed system architecture.
+
 ```mermaid
 flowchart LR
     Mic[Microphone] --> AudioIn[LocalAudioTransport]
@@ -111,16 +113,16 @@ pipecat-voice-agent/
 `-- tests/                           # Mocked regression suites
 ```
 
-VoiceMem remains in its separate sibling repository:
+VoiceMem remains in a separate sibling repository. The commands below assume
+this portable layout:
 
 ```text
-Pipecat/
+workspace/
 |-- pipecat-voice-agent/
-|-- .pipevenv/
-`-- voicemem-test/
-    |-- .vmvenv/
-    `-- VoiceMem/
-        `-- service/app.py
+|   `-- .venv/
+`-- VoiceMem/
+    |-- .venv/
+    `-- service/app.py
 ```
 
 ## Prerequisites
@@ -131,18 +133,18 @@ Pipecat/
 - Docker or another Qdrant 1.x installation
 - Google Cloud project with Calendar and Sheets APIs enabled
 - Google OAuth desktop credentials and a Sheet with a `Sheet1` tab
-- Companion VoiceMem repository and its tested `.vmvenv` for persistent memory
+- Companion `VoiceMem/` repository for persistent memory
 
 The agent remains usable if Qdrant or VoiceMem is unavailable. The affected retrieval path fails open while normal conversation and booking continue.
 
 ## Installation
 
-From `D:\AI Internship\Pipecat`:
+From the `pipecat-voice-agent` repository root:
 
 ```powershell
-python -m venv .pipevenv
-& ".\.pipevenv\Scripts\Activate.ps1"
-pip install -r ".\pipecat-voice-agent\requirements.txt"
+python -m venv .venv
+& ".\.venv\Scripts\Activate.ps1"
+pip install -r requirements.txt
 ```
 
 The project is pinned to Pipecat 1.10.0. Validate frame, turn, metrics, and service APIs before changing that version.
@@ -150,7 +152,6 @@ The project is pinned to Pipecat 1.10.0. Validate frame, turn, metrics, and serv
 ## Environment configuration
 
 ```powershell
-cd "D:\AI Internship\Pipecat\pipecat-voice-agent"
 Copy-Item .env.example .env
 ```
 
@@ -167,7 +168,7 @@ Copy-Item .env.example .env
 Optional local additions:
 
 ```dotenv
-TEST_CALLER_ID=terminal_live_001
+TEST_CALLER_ID=demo_caller_001
 VOICEMEM_SIDECAR_URL=http://127.0.0.1:8765
 ```
 
@@ -222,8 +223,7 @@ docker start agentix-qdrant
 Build or rebuild the index explicitly:
 
 ```powershell
-cd "D:\AI Internship\Pipecat\pipecat-voice-agent"
-& "..\.pipevenv\Scripts\python.exe" -m rag.index
+& ".\.venv\Scripts\python.exe" -m rag.index
 ```
 
 The indexer loads `knowledge/agentix_rag_knowledge_base.md` with Docling, chunks it with `HybridChunker`, creates dense BGE and sparse BM25 vectors, and stores both in `agentix_rag_knowledge`. Starting the voice agent does not re-index it.
@@ -231,9 +231,9 @@ The indexer loads `knowledge/agentix_rag_knowledge_base.md` with Docling, chunks
 Test retrieval:
 
 ```powershell
-& "..\.pipevenv\Scripts\python.exe" -m rag.cli
-& "..\.pipevenv\Scripts\python.exe" -m rag.cli "What is PongVerse?"
-& "..\.pipevenv\Scripts\python.exe" -m rag.evaluate
+& ".\.venv\Scripts\python.exe" -m rag.cli
+& ".\.venv\Scripts\python.exe" -m rag.cli "What is PongVerse?"
+& ".\.venv\Scripts\python.exe" -m rag.evaluate
 ```
 
 The retriever prefetches dense and sparse candidates, applies Qdrant RRF, and returns at most three chunks. The integration uses only the useful subset, preferring one strong chunk when sufficient.
@@ -243,12 +243,15 @@ The retriever prefetches dense and sparse candidates, applies Qdrant RRF, and re
 VoiceMem runs separately to isolate its dependency stack. In another PowerShell window:
 
 ```powershell
-cd "D:\AI Internship\Pipecat\voicemem-test\VoiceMem"
-$env:TEST_CALLER_ID="terminal_live_001"
-& "..\.vmvenv\Scripts\python.exe" -m uvicorn service.app:app `
+Set-Location ..\VoiceMem
+python -m venv .venv
+& ".\.venv\Scripts\Activate.ps1"
+pip install -e .
+$env:TEST_CALLER_ID="demo_caller_001"
+& ".\.venv\Scripts\python.exe" -m uvicorn service.app:app `
   --host 127.0.0.1 `
   --port 8765 `
-  --env-file "..\..\pipecat-voice-agent\.env"
+  --env-file "..\pipecat-voice-agent\.env"
 ```
 
 ```powershell
@@ -268,16 +271,15 @@ Live memory behavior:
 ## Run the voice agent
 
 ```powershell
-cd "D:\AI Internship\Pipecat\pipecat-voice-agent"
-$env:TEST_CALLER_ID="terminal_live_001"
-& "..\.pipevenv\Scripts\python.exe" .\main.py
+$env:TEST_CALLER_ID="demo_caller_001"
+& ".\.venv\Scripts\python.exe" .\main.py
 ```
 
 Use a different stable ID to test caller isolation:
 
 ```powershell
-$env:TEST_CALLER_ID="terminal_live_002"
-& "..\.pipevenv\Scripts\python.exe" .\main.py
+$env:TEST_CALLER_ID="demo_caller_002"
+& ".\.venv\Scripts\python.exe" .\main.py
 ```
 
 Concise diagnostics show routing without exposing internals to the caller:
@@ -320,8 +322,7 @@ Before disk write, the recorder redacts configured secrets, names, emails, phone
 Run the offline mocked suite without Groq, Deepgram, or Google API usage:
 
 ```powershell
-cd "D:\AI Internship\Pipecat\pipecat-voice-agent"
-& "..\.pipevenv\Scripts\python.exe" -m unittest `
+& ".\.venv\Scripts\python.exe" -m unittest `
   tests.test_booking_conversation_e2e `
   tests.test_booking_session `
   tests.test_booking_workflow `
@@ -335,8 +336,8 @@ cd "D:\AI Internship\Pipecat\pipecat-voice-agent"
 Run sidecar tests separately:
 
 ```powershell
-cd "D:\AI Internship\Pipecat\voicemem-test\VoiceMem"
-& "..\.vmvenv\Scripts\python.exe" -m unittest service.test_app -v
+Set-Location ..\VoiceMem
+& ".\.venv\Scripts\python.exe" -m unittest service.test_app -v
 ```
 
 `tests/test_calendar.py` is a standalone live Google Calendar script and is intentionally excluded from the offline command.
@@ -377,7 +378,8 @@ Do not commit VoiceMem's caller-data directory from the companion repository.
 
 ## Troubleshooting
 
-**VS Code import warnings:** select `D:\AI Internship\Pipecat\.pipevenv\Scripts\python.exe`.
+**VS Code import warnings:** from the repository root, select
+`.venv\Scripts\python.exe` as the Python interpreter.
 
 **RAG unavailable:** confirm Qdrant is reachable on port `6333`, the collection exists, and `rag.cli` returns results.
 
@@ -391,4 +393,15 @@ Do not commit VoiceMem's caller-data directory from the companion repository.
 
 ## License
 
-No project license is currently specified. Add one before public distribution.
+This project is licensed under the Apache License 2.0. See [LICENSE](LICENSE).
+
+### Third-party software
+
+- Pipecat is used under the BSD-2-Clause license.
+- VoiceMem is a separate companion fork derived from
+  [xzf-thu/VoiceMem](https://github.com/xzf-thu/VoiceMem) and remains licensed
+  under Apache License 2.0.
+- Other dependencies retain their respective licenses.
+
+The project license does not replace, alter, or claim ownership of Pipecat,
+VoiceMem, or any other third-party software.

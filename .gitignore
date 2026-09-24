@@ -67,6 +67,7 @@ dist/
 # Logs and local editor/OS files
 *.log
 traces/
+implementation.md
 .idea/
 .vscode/
 .DS_Store
