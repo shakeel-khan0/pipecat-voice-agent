@@ -67,15 +67,36 @@ _WRITE_NOISE = re.compile(
     r"[.!?\s]*$|^\s*(?:i am|i'm)\s+(?:okay|fine|good|great|ready)[.!?\s]*$",
     re.IGNORECASE,
 )
-_SENSITIVE_CONTACT = re.compile(
-    r"\b(?:email|e-mail|phone|telephone|mobile|contact number)\b|"
-    r"\b[^\s@]+@[^\s@]+\.[^\s@]+\b",
+_MARKDOWN_MAILTO = re.compile(r"\[[^\]]*\]\(mailto:[^)]+\)", re.IGNORECASE)
+_EMAIL_ADDRESS = re.compile(
+    r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
     re.IGNORECASE,
 )
+_SPOKEN_EMAIL = re.compile(
+    r"\b[A-Z0-9._+-]+(?:\s+dot\s+[A-Z0-9._+-]+)*\s+at\s+"
+    r"[A-Z0-9-]+(?:\s+dot\s+[A-Z0-9-]+)+\b",
+    re.IGNORECASE,
+)
+_PHONE_NUMBER = re.compile(r"(?<!\w)\+?\d(?:[\s().-]*\d){7,}(?!\w)")
+_CONTACT_CLAUSE = re.compile(
+    r"\b(?:"
+    r"(?:(?:my|the|an?)\s+)?e-?mail(?:\s+address)?\s*(?:is|=)|"
+    r"(?:my\s+)?(?:phone|telephone|mobile)(?:\s+number)?\s*(?:is|=)|"
+    r"contact number|(?:reach|call|text) me at"
+    r")\b",
+    re.IGNORECASE,
+)
+_PRIVATE_SYSTEM_DATA = re.compile(
+    r"\b(?:api key|access token|refresh token|oauth token|authorization header|"
+    r"bearer token|tool call|function call|spreadsheet id|calendar event id)\b",
+    re.IGNORECASE,
+)
+_CLAUSE_SEPARATOR = re.compile(r"\s*(?:[,;]|\band\b)\s*", re.IGNORECASE)
 _DURABLE_SIGNAL = re.compile(
     r"\b(?:my name|i am|i'm|i have|i run|i own|i work|"
     r"my (?:business|company|job|role|clinic)|"
-    r"we (?:run|own|need|want|miss|struggle|have)|"
+    r"we (?:currently\s+)?(?:run|own|need|want|miss|struggle|have|use|manage|"
+    r"handle|receive|process|track|operate)|"
     r"i (?:prefer|usually|always|need|want|plan|decided|chose)|"
     r"my (?:goal|goals|preference|preferences|need|needs|problem|problems)|"
     r"prefer|preference|recurring|every day|every week)\b",
@@ -125,14 +146,66 @@ def needs_memory(query: str) -> bool:
     )
 
 
+def sanitize_memory_candidate(content: str) -> str:
+    """Remove contact/private clauses while retaining independent durable facts."""
+    text = " ".join(content.split())
+    if not text:
+        return ""
+    if not any(pattern.search(text) for pattern in (
+        _MARKDOWN_MAILTO,
+        _EMAIL_ADDRESS,
+        _SPOKEN_EMAIL,
+        _PHONE_NUMBER,
+        _CONTACT_CLAUSE,
+        _PRIVATE_SYSTEM_DATA,
+    )):
+        return text
+
+    text = _MARKDOWN_MAILTO.sub("", text)
+    parts = _CLAUSE_SEPARATOR.split(text)
+    safe_parts = []
+    changed = len(parts) > 1
+    for part in parts:
+        part = part.strip()
+        if not part:
+            changed = True
+            continue
+        if _CONTACT_CLAUSE.search(part) or _PRIVATE_SYSTEM_DATA.search(part):
+            changed = True
+            continue
+        cleaned = _EMAIL_ADDRESS.sub("", part)
+        cleaned = _SPOKEN_EMAIL.sub("", cleaned)
+        cleaned = _PHONE_NUMBER.sub("", cleaned)
+        cleaned = re.sub(r"\s+([,.;!?])", r"\1", cleaned)
+        cleaned = " ".join(cleaned.split()).strip(" ,;")
+        if cleaned != part:
+            changed = True
+        if cleaned.strip(".!? "):
+            safe_parts.append(cleaned)
+
+    if not safe_parts:
+        return ""
+    if not changed:
+        return safe_parts[0]
+
+    punctuation = text[-1] if text[-1:] in ".!?" else "."
+    return " and ".join(part.rstrip(" .!?") for part in safe_parts) + punctuation
+
+
 def is_useful_memory(content: str) -> bool:
     """Allow durable caller facts while excluding noise and contact PII."""
-    text = " ".join(content.split())
+    text = sanitize_memory_candidate(content)
     if len(text.split()) < 3 or _WRITE_NOISE.fullmatch(text):
         return False
     if _WRITE_INTERROGATIVE.search(text) or needs_memory(text):
         return False
-    if _SENSITIVE_CONTACT.search(text):
+    if (
+        _CONTACT_CLAUSE.search(text)
+        or _EMAIL_ADDRESS.search(text)
+        or _SPOKEN_EMAIL.search(text)
+        or _PHONE_NUMBER.search(text)
+        or _PRIVATE_SYSTEM_DATA.search(text)
+    ):
         return False
     if _TRANSACTIONAL_BOOKING.search(text) and not re.search(
         r"\b(?:prefer|preference|always|usually)\b", text, re.IGNORECASE
@@ -303,12 +376,13 @@ class VoiceMemIngestProcessor(FrameProcessor):
         if frame.id in self._seen_ids:
             return
         self._remember_frame_id(frame.id)
-        if not is_useful_memory(frame.text):
+        candidate = sanitize_memory_candidate(frame.text)
+        if not is_useful_memory(candidate):
             print("Memory write: skipped")
             return
 
         task = self.create_task(
-            self._write(resolve_caller_id(), frame.text),
+            self._write(resolve_caller_id(), candidate),
             name=f"voicemem-ingest-{frame.id}",
         )
         self._pending.add(task)

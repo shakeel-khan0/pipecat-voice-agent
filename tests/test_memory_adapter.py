@@ -23,6 +23,7 @@ from memory.integration import (
     is_caller_history_query,
     is_useful_memory,
     needs_memory,
+    sanitize_memory_candidate,
     temporary_memory_instruction,
 )
 from memory.voicemem_adapter import VoiceMemAdapter
@@ -340,6 +341,9 @@ class VoiceMemAdapterTests(unittest.IsolatedAsyncioTestCase):
             "We miss customer calls after business hours.",
             "Yes, I prefer evening meetings.",
             "I want to automate our lead booking process.",
+            "We currently manage leads manually.",
+            "We use Google Sheets for lead handling.",
+            "We receive around 50 to 60 inbound calls per day.",
         ]
         skipped = [
             "Hello.",
@@ -366,6 +370,85 @@ class VoiceMemAdapterTests(unittest.IsolatedAsyncioTestCase):
         for text in skipped:
             with self.subTest(text=text):
                 self.assertFalse(is_useful_memory(text))
+
+    async def test_mixed_contact_turns_retain_only_safe_durable_facts(self):
+        cases = [
+            (
+                "My name is Ali, and my email is ali@gmail.com.",
+                "My name is Ali.",
+            ),
+            (
+                "My name is Ali and my email is [ali@gmail.com](mailto:ali@gmail.com).",
+                "My name is Ali.",
+            ),
+            (
+                "I run a real estate business, and my phone number is +1 555 123 4567, "
+                "and my email is owner@example.com.",
+                "I run a real estate business.",
+            ),
+            (
+                "My name is Ali, and the email is elitecon at gmail dot com.",
+                "My name is Ali.",
+            ),
+        ]
+        for original, expected in cases:
+            with self.subTest(original=original):
+                sanitized = sanitize_memory_candidate(original)
+                self.assertEqual(sanitized, expected)
+                self.assertTrue(is_useful_memory(sanitized))
+                self.assertNotIn("@", sanitized)
+                self.assertNotIn("gmail", sanitized.lower())
+                self.assertNotRegex(sanitized, r"\+?\d(?:[\s().-]*\d){7,}")
+
+    async def test_workflow_and_volume_disclosures_are_write_eligible(self):
+        facts = [
+            "We currently manage leads manually.",
+            "We use Google Sheets for lead handling.",
+            "We currently use Google Sheets and handle operations manually.",
+            "We receive around 50 to 60 inbound calls per day.",
+        ]
+        for fact in facts:
+            with self.subTest(fact=fact):
+                self.assertEqual(sanitize_memory_candidate(fact), fact)
+                self.assertTrue(is_useful_memory(fact))
+
+    async def test_contact_booking_recall_and_filler_remain_ineligible(self):
+        skipped = [
+            "My email is ali@example.com.",
+            "My phone number is +1 555 123 4567.",
+            "My API key is gsk_example_private_value.",
+            "The spreadsheet ID is private-tool-data.",
+            "Tomorrow at 5 PM.",
+            "I want to book a meeting tomorrow at 5 PM.",
+            "What is my name?",
+            "Do you remember my preference?",
+            "Yes, that's correct.",
+            "Okay, thanks.",
+        ]
+        for text in skipped:
+            with self.subTest(text=text):
+                self.assertFalse(is_useful_memory(text))
+
+    async def test_processor_sends_only_sanitized_mixed_turn_to_voicemem(self):
+        adapter = AsyncMock(spec=VoiceMemAdapter)
+        adapter.initialize.return_value = True
+        adapter.ingest.return_value = True
+        processor = VoiceMemIngestProcessor(adapter)
+        processor.push_frame = AsyncMock()
+        processor.create_task = lambda coro, name=None: asyncio.create_task(coro)
+        frame = TranscriptionFrame(
+            "My name is Ali, and my email is ali@gmail.com.",
+            "user",
+            "now",
+            finalized=True,
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            await processor.process_frame(frame, None)
+            await asyncio.sleep(0)
+
+        adapter.ingest.assert_awaited_once_with(
+            DEFAULT_TEST_CALLER_ID, "My name is Ali.")
 
     async def test_assertions_queue_but_recall_questions_do_not(self):
         adapter = AsyncMock(spec=VoiceMemAdapter)
