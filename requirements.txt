@@ -16,7 +16,7 @@ python-dotenv==1.2.3
 loguru==0.7.3
 tzdata==2026.4
 
-# Standalone hybrid RAG (not integrated with the live voice agent).
+# Hybrid RAG dependencies for grounded company knowledge retrieval.
 docling==2.129.0
 fastembed==0.8.0
 qdrant-client==1.19.1
