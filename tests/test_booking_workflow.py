@@ -4,13 +4,20 @@ import unittest
 import importlib
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from zoneinfo import ZoneInfo
 
 import main
 from agent.booking_session import BookingSession
-from pipecat.frames.frames import LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMTextFrame
-from pipecat.turns.user_mute import FunctionCallUserMuteStrategy
+from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    LLMTextFrame,
+    TranscriptionFrame,
+)
+from pipecat.turns.user_mute import AlwaysUserMuteStrategy, FunctionCallUserMuteStrategy
 
 workflow = importlib.import_module("agent.graph")
 
@@ -21,6 +28,7 @@ class BookingWorkflowCallbackTests(unittest.IsolatedAsyncioTestCase):
         main._pending_email_turn = 0
         main.transcription_printer.latest_text = ""
         main.transcription_printer.turn_id = 0
+        main.transcription_printer.recent_texts.clear()
 
     async def test_model_cannot_supply_an_unspoken_day_part(self):
         callback = AsyncMock()
@@ -41,6 +49,67 @@ class BookingWorkflowCallbackTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(session.advance.await_args.kwargs["time_preference"], "")
+
+    async def test_recent_caller_day_part_is_preserved_for_availability_followup(self):
+        callback = AsyncMock()
+        params = SimpleNamespace(
+            result_callback=callback,
+            llm=SimpleNamespace(push_frame=AsyncMock()),
+        )
+        session = SimpleNamespace(advance=AsyncMock(return_value={
+            "status": "needs_input",
+            "spoken_response": "I can offer 05:00 PM. Which works best?",
+            "offered_slots": ["05:00 PM"],
+        }))
+        main.transcription_printer.recent_texts.extend([
+            "I'll go with evening.",
+            "What slots are empty?",
+        ])
+        main.transcription_printer.latest_text = "What slots are empty?"
+
+        with patch.object(main, "booking_session", session):
+            await main.booking_workflow(params, time_preference="evening")
+
+        self.assertEqual(
+            session.advance.await_args.kwargs["time_preference"], "evening")
+
+    async def test_latest_caller_day_part_overrides_an_older_preference(self):
+        callback = AsyncMock()
+        params = SimpleNamespace(
+            result_callback=callback,
+            llm=SimpleNamespace(push_frame=AsyncMock()),
+        )
+        session = SimpleNamespace(advance=AsyncMock(return_value={
+            "status": "needs_input",
+            "spoken_response": "I can offer 10:00 AM. Which works best?",
+        }))
+        main.transcription_printer.recent_texts.extend([
+            "Evening works for me.",
+            "Actually, switch that to morning.",
+        ])
+        main.transcription_printer.latest_text = "Actually, switch that to morning."
+
+        with patch.object(main, "booking_session", session):
+            await main.booking_workflow(params, time_preference="evening")
+
+        self.assertEqual(session.advance.await_args.kwargs["time_preference"], "")
+
+    async def test_other_slot_question_reaches_session_as_alternative_request(self):
+        params = SimpleNamespace(
+            result_callback=AsyncMock(),
+            llm=SimpleNamespace(push_frame=AsyncMock()),
+        )
+        session = SimpleNamespace(advance=AsyncMock(return_value={
+            "status": "needs_input",
+            "spoken_response": "I can offer 04:30 PM. Which works best?",
+            "offered_slots": ["04:30 PM"],
+        }))
+        main.transcription_printer.latest_text = "Are there any other available slots?"
+
+        with patch.object(main, "booking_session", session):
+            await main.booking_workflow(params)
+
+        self.assertTrue(session.advance.await_args.kwargs["request_alternatives"])
 
     async def test_ambiguous_spoken_email_is_confirmed_before_booking(self):
         callback = AsyncMock()
@@ -133,11 +202,51 @@ class BookingWorkflowCallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(frames[1].text, args[0]["spoken_response"])
         self.assertIsInstance(frames[2], LLMFullResponseEndFrame)
 
-    def test_function_call_mute_ends_before_tts_barge_in(self):
+    def test_supported_function_and_bot_speaking_mute_strategies_are_enabled(self):
         strategies = main.user_aggregator._params.user_mute_strategies
         self.assertTrue(any(isinstance(item, FunctionCallUserMuteStrategy) for item in strategies))
+        self.assertTrue(any(isinstance(item, AlwaysUserMuteStrategy) for item in strategies))
         self.assertTrue(main.booking_workflow._pipecat_cancel_on_interruption)
         self.assertTrue(main.stt._should_interrupt)
+
+    async def test_bot_speech_transcript_cannot_reach_user_turn_pipeline(self):
+        gate = main.BotSpeakingTranscriptionGate(enabled=True)
+        gate.push_frame = AsyncMock()
+        await gate.process_frame(BotStartedSpeakingFrame(), None)
+        echoed = TranscriptionFrame("Great.", "user", "now", finalized=True)
+        await gate.process_frame(echoed, None)
+        await gate.process_frame(BotStoppedSpeakingFrame(), None)
+        real_user = TranscriptionFrame("Hello.", "user", "later", finalized=True)
+        await gate.process_frame(real_user, None)
+
+        forwarded = [call.args[0] for call in gate.push_frame.await_args_list]
+        self.assertNotIn(echoed, forwarded)
+        self.assertIn(real_user, forwarded)
+
+    async def test_headphone_mode_keeps_transcription_barge_in_path_open(self):
+        gate = main.BotSpeakingTranscriptionGate(enabled=False)
+        gate.push_frame = AsyncMock()
+        await gate.process_frame(BotStartedSpeakingFrame(), None)
+        interruption = TranscriptionFrame(
+            "Wait, I need another time.", "user", "now", finalized=True)
+        await gate.process_frame(interruption, None)
+
+        forwarded = [call.args[0] for call in gate.push_frame.await_args_list]
+        self.assertIn(interruption, forwarded)
+
+    async def test_spoken_question_is_available_to_next_memory_write_only(self):
+        memory_writer = SimpleNamespace(note_assistant_response=Mock())
+        printer = main.LLMPrintProcessor(memory_writer)
+        printer.push_frame = AsyncMock()
+
+        with patch("builtins.print"):
+            await printer.process_frame(LLMFullResponseStartFrame(), None)
+            await printer.process_frame(LLMTextFrame(
+                "Approximately how many leads do you receive each day?"), None)
+            await printer.process_frame(LLMFullResponseEndFrame(), None)
+
+        memory_writer.note_assistant_response.assert_called_once_with(
+            "Approximately how many leads do you receive each day?")
 
     def test_reasoning_is_hidden_from_spoken_output(self):
         self.assertEqual(

@@ -160,6 +160,53 @@ class BookingSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("10:00 AM", result["spoken_response"])
         self.assertNotIn("05:00 PM", result["spoken_response"])
 
+    async def test_day_part_selected_before_lookup_survives_interrupt_resume(self):
+        self.slots.return_value = [
+            "10:00 AM", "02:00 PM", "04:30 PM", "05:00 PM"]
+        first = await self.session.advance(time_preference="evening")
+        self.assertIn("Which date", first["spoken_response"])
+
+        result = await self.session.advance(meeting_date=DATE)
+
+        self.assertEqual(result["offered_slots"], ["05:00 PM"])
+        self.assertNotIn("morning, afternoon, or evening", result["spoken_response"])
+
+    async def test_other_slots_are_calendar_backed_and_never_invented(self):
+        real_slots = ["03:30 PM", "04:00 PM", "04:30 PM", "05:00 PM"]
+        self.slots.return_value = real_slots
+        await self.session.advance(meeting_date=DATE)
+        first = await self.session.advance(time_preference="evening")
+        self.assertEqual(first["offered_slots"], ["05:00 PM"])
+
+        other = await self.session.advance(request_alternatives=True)
+
+        self.assertTrue(other["offered_slots"])
+        self.assertTrue(set(other["offered_slots"]).issubset(real_slots))
+        self.assertNotIn("06:00 PM", other["spoken_response"])
+        self.assertNotIn("05:00 PM", other["offered_slots"])
+
+    async def test_no_evening_availability_offers_only_real_alternatives(self):
+        real_slots = ["02:00 PM", "03:30 PM", "04:30 PM"]
+        self.slots.return_value = real_slots
+        await self.session.advance(meeting_date=DATE)
+
+        result = await self.session.advance(time_preference="evening")
+
+        self.assertIn("don't have availability in that period", result["spoken_response"])
+        self.assertTrue(set(result["offered_slots"]).issubset(real_slots))
+        self.assertNotIn("05:00 PM", result["spoken_response"])
+        self.assertNotIn("06:00 PM", result["spoken_response"])
+
+    async def test_switching_day_part_after_lookup_is_allowed(self):
+        self.slots.return_value = ["10:00 AM", "02:00 PM", "04:00 PM", "05:00 PM"]
+        await self.session.advance(meeting_date=DATE)
+        afternoon = await self.session.advance(time_preference="afternoon")
+        self.assertEqual(afternoon["offered_slots"], ["02:00 PM", "04:00 PM"])
+
+        evening = await self.session.advance(time_preference="evening")
+
+        self.assertEqual(evening["offered_slots"], ["05:00 PM"])
+
     async def test_specific_spoken_time_is_selected_and_booking_continues(self):
         self.slots.return_value = ["02:00 PM", "03:00 PM", "04:00 PM", "05:00 PM", "05:30 PM"]
         first = await self.session.advance(meeting_date=DATE)

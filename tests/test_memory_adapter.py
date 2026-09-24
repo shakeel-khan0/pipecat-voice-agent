@@ -20,6 +20,7 @@ from memory.caller_identity import DEFAULT_TEST_CALLER_ID, resolve_caller_id
 from memory.integration import (
     VoiceMemContextProcessor,
     VoiceMemIngestProcessor,
+    contextualize_memory_candidate,
     is_caller_history_query,
     is_useful_memory,
     needs_memory,
@@ -568,6 +569,69 @@ class VoiceMemAdapterTests(unittest.IsolatedAsyncioTestCase):
         ]))
         await processor.process_frame(internal, None)
         adapter.ingest.assert_not_called()
+
+    async def test_short_metric_answer_uses_one_question_of_context(self):
+        self.assertEqual(
+            contextualize_memory_candidate(
+                "It's between fifty to sixty.",
+                "Approximately how many leads do you receive each day?",
+            ),
+            "We receive between fifty to sixty leads each day.",
+        )
+
+        adapter = AsyncMock(spec=VoiceMemAdapter)
+        adapter.initialize.return_value = True
+        adapter.ingest.return_value = True
+        processor = VoiceMemIngestProcessor(adapter)
+        processor.push_frame = AsyncMock()
+        processor.create_task = lambda coro, name=None: asyncio.create_task(coro)
+        processor.note_assistant_response(
+            "Approximately how many leads do you receive each day?")
+        frame = TranscriptionFrame(
+            "It's between fifty to sixty.", "user", "now", finalized=True)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            await processor.process_frame(frame, None)
+            await asyncio.sleep(0)
+
+        adapter.ingest.assert_awaited_once_with(
+            DEFAULT_TEST_CALLER_ID,
+            "We receive between fifty to sixty leads each day.",
+        )
+
+    async def test_context_does_not_make_booking_choice_a_stable_preference(self):
+        adapter = AsyncMock(spec=VoiceMemAdapter)
+        processor = VoiceMemIngestProcessor(adapter)
+        processor.push_frame = AsyncMock()
+        processor.note_assistant_response(
+            "What works better for this booking: morning, afternoon, or evening?")
+        frame = TranscriptionFrame(
+            "I'll go with evening.", "user", "now", finalized=True)
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            await processor.process_frame(frame, None)
+
+        adapter.ingest.assert_not_called()
+        self.assertIn("skipped | filter", output.getvalue())
+
+    async def test_zero_new_memory_has_distinct_safe_reason(self):
+        adapter = AsyncMock(spec=VoiceMemAdapter)
+        adapter.initialize.return_value = True
+        adapter.ingest.return_value = None
+        processor = VoiceMemIngestProcessor(adapter)
+        processor.push_frame = AsyncMock()
+        processor.create_task = lambda coro, name=None: asyncio.create_task(coro)
+        frame = TranscriptionFrame(
+            "I run a real estate business.", "user", "now", finalized=True)
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            await processor.process_frame(frame, None)
+            await asyncio.sleep(0)
+
+        self.assertIn("Memory write: queued", output.getvalue())
+        self.assertIn("Memory write: skipped | no_new_memory", output.getvalue())
 
 
 if __name__ == "__main__":

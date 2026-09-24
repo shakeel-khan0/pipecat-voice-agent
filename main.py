@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+from collections import deque
 from time import perf_counter
 from pathlib import Path
 from datetime import datetime
@@ -17,6 +18,9 @@ from pipecat.frames.frames import (
     LLMFullResponseEndFrame,
     LLMTextFrame,
     FunctionCallResultProperties,
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
+    InterimTranscriptionFrame,
 )
 from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.transports.local.audio import (
@@ -33,7 +37,7 @@ from pipecat.services.deepgram.tts import DeepgramTTSService
 from pipecat.services.deepgram.flux.stt import DeepgramFluxSTTService
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.turns.user_mute import FunctionCallUserMuteStrategy
+from pipecat.turns.user_mute import AlwaysUserMuteStrategy, FunctionCallUserMuteStrategy
 from pipecat.utils.text.base_text_filter import BaseTextFilter
 
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -73,6 +77,9 @@ _pending_email = ""
 _pending_email_turn = 0
 
 _DAY_PARTS = ("morning", "afternoon", "evening")
+_LOCAL_AUDIO_ECHO_GUARD = os.getenv("LOCAL_AUDIO_ECHO_GUARD", "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
 
 
 def _latest_caller_text():
@@ -85,13 +92,27 @@ def _latest_caller_turn():
     return getattr(printer, "turn_id", 0)
 
 
+def _recent_caller_texts():
+    printer = globals().get("transcription_printer")
+    return tuple(getattr(printer, "recent_texts", ()))
+
+
 def _caller_supported_time_preference(preference: str, caller_text: str) -> str:
     """Reject a model-invented day-part while preserving caller-supplied preferences."""
     preference_lower = preference.lower()
-    caller_lower = caller_text.lower()
+    caller_turns = (*_recent_caller_texts(), caller_text)
     stated_parts = [part for part in _DAY_PARTS if part in preference_lower]
-    if stated_parts and not any(part in caller_lower for part in stated_parts):
-        return ""
+    if stated_parts:
+        latest_caller_parts = next(
+            (
+                [part for part in _DAY_PARTS if part in turn.lower()]
+                for turn in reversed(caller_turns)
+                if any(part in turn.lower() for part in _DAY_PARTS)
+            ),
+            [],
+        )
+        if not any(part in latest_caller_parts for part in stated_parts):
+            return ""
     return preference
 
 
@@ -157,6 +178,8 @@ async def booking_workflow(
     caller_text = _latest_caller_text()
     caller_turn = _latest_caller_turn()
     time_preference = _caller_supported_time_preference(time_preference, caller_text)
+    request_alternatives = bool(re.search(
+        r"\b(?:other|another|else|alternative)s?\b", caller_text, re.IGNORECASE))
     confirm_email = bool(
         email
         and caller_turn > 0
@@ -168,6 +191,7 @@ async def booking_workflow(
         name=name,
         email="" if confirm_email else email,
         time_preference=time_preference,
+        request_alternatives=request_alternatives,
     )
     if confirm_email:
         # Preserve all other booking progress, but do not write an uncertain address.
@@ -251,6 +275,32 @@ transport = LocalAudioTransport(
     )
 )
 
+
+class BotSpeakingTranscriptionGate(FrameProcessor):
+    """Keep local-speaker echo out of logging, memory, and user-turn handling."""
+
+    def __init__(self, enabled: bool):
+        super().__init__()
+        self.enabled = enabled
+        self.bot_speaking = False
+
+    async def process_frame(self, frame: Frame, direction):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, BotStartedSpeakingFrame):
+            self.bot_speaking = True
+        elif isinstance(frame, BotStoppedSpeakingFrame):
+            self.bot_speaking = False
+        elif (
+            self.enabled
+            and self.bot_speaking
+            and isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame))
+        ):
+            return
+        await self.push_frame(frame, direction)
+
+
+transcription_gate = BotSpeakingTranscriptionGate(_LOCAL_AUDIO_ECHO_GUARD)
+
 context = LLMContext(
     tools=[
         booking_workflow,
@@ -261,10 +311,13 @@ user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
     context,
     user_params=LLMUserAggregatorParams(
         vad_analyzer=SileroVADAnalyzer(),
-        # Prevent a false interruption from cancelling the callback after the
-        # shielded Calendar/Sheets work has already completed. This mute ends
-        # with the function result, before TTS starts, so TTS barge-in remains.
-        user_mute_strategies=[FunctionCallUserMuteStrategy()],
+        # Function calls stay protected from cancellation. In local-speaker
+        # mode, Pipecat's bot-speaking mute also prevents acoustic echo from
+        # becoming a user turn; headphone mode can disable that echo guard.
+        user_mute_strategies=[
+            FunctionCallUserMuteStrategy(),
+            *([AlwaysUserMuteStrategy()] if _LOCAL_AUDIO_ECHO_GUARD else []),
+        ],
     ),
 )
 
@@ -274,17 +327,27 @@ memory_ingest = VoiceMemIngestProcessor()
 retrieval_prefetch = RetrievalPrefetchProcessor(rag_context, memory_context)
 
 class LLMPrintProcessor(FrameProcessor):
+    def __init__(self, memory_writer: VoiceMemIngestProcessor | None = None):
+        super().__init__()
+        self._memory_writer = memory_writer
+        self._response_parts = []
+
     async def process_frame(self, frame: Frame, direction):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, LLMFullResponseStartFrame):
+            self._response_parts = []
             trace_recorder.start_assistant_response()
 
         if isinstance(frame, TextFrame):
+            self._response_parts.append(frame.text)
             trace_recorder.assistant_text(frame.text)
             print(frame.text, end="", flush=True)
 
         if isinstance(frame, LLMFullResponseEndFrame):
+            if self._memory_writer is not None:
+                self._memory_writer.note_assistant_response(
+                    "".join(self._response_parts))
             trace_recorder.end_assistant_response()
             print()
 
@@ -295,6 +358,7 @@ class TranscriptionPrinter(FrameProcessor):
         super().__init__()
         self.latest_text = ""
         self.turn_id = 0
+        self.recent_texts = deque(maxlen=4)
 
     async def process_frame(self, frame: Frame, direction):
         await super().process_frame(frame, direction)
@@ -302,6 +366,7 @@ class TranscriptionPrinter(FrameProcessor):
         if isinstance(frame, TranscriptionFrame):
             self.latest_text = frame.text
             self.turn_id += 1
+            self.recent_texts.append(frame.text)
             trace_recorder.user_turn(frame.text)
             print(f"You: {frame.text}")
 
@@ -313,6 +378,7 @@ transcription_printer = TranscriptionPrinter()
 pipeline = Pipeline([
     transport.input(),
     stt,
+    transcription_gate,
     transcription_printer,
     memory_ingest,
     user_aggregator,
@@ -320,7 +386,7 @@ pipeline = Pipeline([
     rag_context,
     memory_context,
     llm,
-    LLMPrintProcessor(),
+    LLMPrintProcessor(memory_ingest),
     tts,
     transport.output(),
     assistant_aggregator,

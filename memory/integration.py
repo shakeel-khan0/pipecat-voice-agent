@@ -113,6 +113,21 @@ _WRITE_INTERROGATIVE = re.compile(
     r"do|does|did|have|has|can|could|would|should|is|are)\b",
     re.IGNORECASE,
 )
+_CONTEXTUAL_METRIC_QUESTION = re.compile(
+    r"\b(?:approximately|roughly|about)?\s*how many\s+"
+    r"(?P<topic>[a-z][a-z\s-]{0,60}?)\s+"
+    r"(?:do|does)\s+(?:you|your (?:business|company|team))\s+"
+    r"(?P<verb>receive|get|handle|process|manage|miss)\b"
+    r"(?P<period>\s+(?:each|per)\s+(?:day|week|month))?\s*[?!.]*$",
+    re.IGNORECASE,
+)
+_CONTEXTUAL_QUANTITY = re.compile(
+    r"\b(?:\d+|zero|one|two|three|four|five|six|seven|eight|nine|ten|"
+    r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|"
+    r"nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|"
+    r"hundred|thousand)\b",
+    re.IGNORECASE,
+)
 
 
 def is_caller_history_query(query: str) -> bool:
@@ -212,6 +227,40 @@ def is_useful_memory(content: str) -> bool:
     ):
         return False
     return bool(_DURABLE_SIGNAL.search(text))
+
+
+def contextualize_memory_candidate(content: str, assistant_prompt: str) -> str:
+    """Turn a short metric answer into a caller fact using one prompt of context.
+
+    This intentionally supports only factual quantity questions with durable
+    workflow verbs. It does not copy the assistant prompt into memory or treat a
+    one-off booking choice as a stable preference.
+    """
+    answer = sanitize_memory_candidate(content)
+    prompt = " ".join(assistant_prompt.split())
+    if not answer or not prompt or not _CONTEXTUAL_QUANTITY.search(answer):
+        return ""
+    match = _CONTEXTUAL_METRIC_QUESTION.search(prompt)
+    if not match:
+        return ""
+
+    quantity = re.sub(
+        r"^\s*(?:(?:uh|um|well|yeah|yes)\s*[,.-]?\s*)*"
+        r"(?:(?:it(?:'s| is)|that(?:'s| is))\s+)?",
+        "",
+        answer,
+        flags=re.IGNORECASE,
+    ).strip(" .!?")
+    if not quantity or len(quantity.split()) > 12:
+        return ""
+
+    topic = " ".join(match.group("topic").split())
+    verb = match.group("verb").lower()
+    period = " ".join((match.group("period") or "").split())
+    statement = f"We {verb} {quantity} {topic}"
+    if period:
+        statement += f" {period}"
+    return statement + "."
 
 
 def temporary_memory_instruction(
@@ -366,6 +415,11 @@ class VoiceMemIngestProcessor(FrameProcessor):
         self._pending: set[asyncio.Task] = set()
         self._seen_ids: set[int] = set()
         self._seen_order: deque[int] = deque(maxlen=256)
+        self._last_assistant_response = ""
+
+    def note_assistant_response(self, content: str) -> None:
+        """Keep only the latest public response for the caller's next answer."""
+        self._last_assistant_response = " ".join(content.split())
 
     async def process_frame(self, frame: Frame, direction):
         await super().process_frame(frame, direction)
@@ -377,8 +431,15 @@ class VoiceMemIngestProcessor(FrameProcessor):
             return
         self._remember_frame_id(frame.id)
         candidate = sanitize_memory_candidate(frame.text)
+        assistant_prompt = self._last_assistant_response
+        self._last_assistant_response = ""
         if not is_useful_memory(candidate):
-            print("Memory write: skipped")
+            contextual = contextualize_memory_candidate(candidate, assistant_prompt)
+            if contextual:
+                candidate = contextual
+        if not is_useful_memory(candidate):
+            reason = "sanitized_empty" if frame.text.strip() and not candidate else "filter"
+            print(f"Memory write: skipped | {reason}")
             return
 
         task = self.create_task(
@@ -410,7 +471,7 @@ class VoiceMemIngestProcessor(FrameProcessor):
             if outcome is True:
                 print(f"Memory write: success | {elapsed_ms:.2f} ms")
             elif outcome is None:
-                print("Memory write: skipped")
+                print("Memory write: skipped | no_new_memory")
             else:
                 error = self._adapter.health().get("error") or "Unavailable"
                 error_type = error.rsplit("(", 1)[-1].rstrip(")")

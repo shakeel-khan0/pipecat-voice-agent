@@ -190,6 +190,11 @@ address yourself. Wait for a new caller turn. After the caller says yes, call
 On every relevant booking follow-up, call the same `booking_workflow`
 with the new information.
 
+Availability follow-ups such as asking what is open, what else is open, or
+requesting alternatives must always call `booking_workflow`; never answer them
+from conversation history. Carry forward the caller's most recent stated
+day-part preference until they select a time or change that preference.
+
 The workflow remembers earlier booking details.
 
 After every workflow result:

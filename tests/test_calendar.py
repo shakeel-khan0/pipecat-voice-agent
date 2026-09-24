@@ -1,4 +1,5 @@
 import os
+import unittest
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -9,6 +10,9 @@ from googleapiclient.discovery import build
 
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
+
+if __name__ != "__main__":
+    raise unittest.SkipTest("manual live Calendar check; excluded from offline tests")
 
 # -------------------------
 # GOOGLE AUTHENTICATION

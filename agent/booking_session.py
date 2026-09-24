@@ -40,6 +40,7 @@ class BookingSession:
         self._time_preference = ""
         self._requested_time = ""
         self._slot_was_taken = False
+        self._last_offered_slots = []
 
     async def advance(self, **details):
         # Keep an in-flight write alive even if its voice/tool response is interrupted.
@@ -58,7 +59,10 @@ class BookingSession:
                 return self._response()
 
             preference = str(details.pop("time_preference", "") or "").strip()
+            request_alternatives = bool(details.pop("request_alternatives", False))
             if preference:
+                if preference.lower() != self._time_preference.lower():
+                    self._last_offered_slots = []
                 self._time_preference = preference
             supplied = {
                 key: str(value).strip()
@@ -110,6 +114,7 @@ class BookingSession:
                         await self.graph.aupdate_state(self.config, {}, as_node="complete")
                     self._result = None
                     self._details.pop("meeting_time", None)
+                    self._last_offered_slots = []
                     self._time_preference = preference
                     self._requested_time = (
                         supplied.get("meeting_time")
@@ -129,7 +134,10 @@ class BookingSession:
                     fields = request["fields"]
                     missing = [key for key in fields if not self._details.get(key)]
                     if missing:
-                        return self._response(missing)
+                        return self._response(
+                            missing,
+                            request_alternatives=request_alternatives,
+                        )
                     if fields == ["meeting_time"]:
                         selected = self._details["meeting_time"]
                         if selected not in request["available_slots"]:
@@ -164,7 +172,7 @@ class BookingSession:
                     if previously_selected or self._result.get("slot_conflict"):
                         self._slot_was_taken = True
                     self._details.pop("meeting_time", None)
-                return self._response()
+                return self._response(request_alternatives=request_alternatives)
             except Exception as exc:
                 trace_recorder.record(
                     "error",
@@ -182,7 +190,7 @@ class BookingSession:
                 }
                 return self._failure
 
-    def _response(self, missing=None):
+    def _response(self, missing=None, request_alternatives=False):
         state = self._result
         response = {key: state.get(key) for key in ("booking_confirmed", "lead_saved")}
         if state.get("__interrupt__"):
@@ -190,7 +198,11 @@ class BookingSession:
             fields = missing or [key for key in request["fields"] if not self._details.get(key)] or request["fields"]
             slots = request.get("available_slots") or state.get("available_slots", [])
             if slots and not self._details.get("meeting_time"):
-                offered = self._choose_slots(slots)
+                candidate_slots = (
+                    [slot for slot in slots if slot not in self._last_offered_slots]
+                    if request_alternatives else slots
+                )
+                offered = self._choose_slots(candidate_slots)
                 if not self._time_preference and not self._requested_time and len(slots) > 3:
                     spoken = "What works better for you: morning, afternoon, or evening?"
                     offered = []
@@ -204,13 +216,19 @@ class BookingSession:
                     spoken = prefix + f"I can offer {self._say_slots(offered)}. Which works best?"
                     self._slot_was_taken = False
                 else:
-                    alternatives = self._nearest_slots(slots)
-                    spoken = "I don't have availability in that period."
+                    alternatives = self._nearest_slots(candidate_slots)
+                    spoken = (
+                        "I don't have any other availability in that period."
+                        if request_alternatives
+                        else "I don't have availability in that period."
+                    )
                     if alternatives:
                         spoken += f" I can offer {self._say_slots(alternatives)}. Which works for you?"
                     else:
                         spoken += " Would you like to try another time or date?"
                     offered = alternatives
+                if offered:
+                    self._last_offered_slots = offered
                 response.update(status="needs_input", spoken_response=spoken,
                                 offered_slots=offered)
             elif "meeting_date" in fields:
