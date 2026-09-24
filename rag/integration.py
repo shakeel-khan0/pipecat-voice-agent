@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+import logging
 from difflib import SequenceMatcher
 import re
 import time
@@ -12,6 +13,8 @@ from pipecat.processors.frame_processor import FrameProcessor
 
 from rag.retrieve import HybridRetriever, RetrievalResult
 from trace_recorder import trace_recorder
+
+logger = logging.getLogger(__name__)
 
 
 _SMALL_TALK = re.compile(
@@ -357,11 +360,52 @@ class RAGContextProcessor(FrameProcessor):
         self._retriever = None
         self._turn_key = None
         self._cached_instruction = None
+        self._prefetched = {}
 
     async def _get_retriever(self):
         if self._retriever is None:
             self._retriever = await asyncio.to_thread(self._retriever_factory)
         return self._retriever
+
+    async def _retrieve_turn(self, query, recent_user_queries):
+        hint, ambiguous = entity_hint(query, recent_user_queries)
+        started = time.perf_counter()
+        retrieval_error = None
+        try:
+            retriever = await self._get_retriever()
+            search_query = retrieval_query(query, hint=hint, ambiguous=ambiguous)
+            results, latency_ms = await asyncio.to_thread(retriever.search, search_query)
+        except Exception as exc:
+            latency_ms = (time.perf_counter() - started) * 1000
+            results = []
+            retrieval_error = exc
+        selected = select_results(query, results, hint=hint)
+        return {
+            "instruction": temporary_instruction(selected, hint=hint, query=query),
+            "selected": selected,
+            "latency_ms": latency_ms,
+            "error": retrieval_error,
+        }
+
+    def prefetch(self, frame: LLMContextFrame):
+        messages = frame.context.get_messages()
+        user_index, query = self._latest_user(messages)
+        recent = [
+            message.get("content", "")
+            for message in messages[:user_index or 0]
+            if isinstance(message, dict)
+            and message.get("role") == "user"
+            and isinstance(message.get("content"), str)
+        ]
+        if not needs_rag(query, recent):
+            return None
+        key = (user_index, query)
+        task = self._prefetched.get(key)
+        if task is None:
+            task = self.create_task(
+                self._retrieve_turn(query, recent), name="rag-prefetch")
+            self._prefetched[key] = task
+        return task
 
     @staticmethod
     def _latest_user(messages):
@@ -412,26 +456,25 @@ class RAGContextProcessor(FrameProcessor):
 
         self._turn_key = turn_key
         self._cached_instruction = None
-        hint, ambiguous = entity_hint(query, recent_user_queries)
         if not needs_rag(query, recent_user_queries):
             print("RAG: skipped")
             trace_recorder.rag_event(used=False)
             await self.push_frame(frame, direction)
             return
 
-        started = time.perf_counter()
-        retrieval_error = None
-        try:
-            retriever = await self._get_retriever()
-            search_query = retrieval_query(query, hint=hint, ambiguous=ambiguous)
-            results, latency_ms = await asyncio.to_thread(retriever.search, search_query)
-        except Exception as exc:
-            latency_ms = (time.perf_counter() - started) * 1000
-            results = []
-            retrieval_error = exc
-        selected = select_results(query, results, hint=hint)
-        self._cached_instruction = temporary_instruction(selected, hint=hint, query=query)
+        task = self._prefetched.pop(turn_key, None)
+        outcome = (
+            await task if task is not None
+            else await self._retrieve_turn(query, recent_user_queries)
+        )
+        selected = outcome["selected"]
+        latency_ms = outcome["latency_ms"]
+        retrieval_error = outcome["error"]
+        self._cached_instruction = outcome["instruction"]
         print(f"RAG: {len(selected)} chunks | {latency_ms:.2f} ms")
+        if retrieval_error:
+            logger.warning(
+                "RAG retrieval failed | %s", type(retrieval_error).__name__)
         trace_recorder.rag_event(
             used=True,
             latency_ms=latency_ms,

@@ -1,159 +1,194 @@
 # Agentix Labs AI Voice Receptionist
 
-A real-time AI voice receptionist built with Pipecat and LangGraph. The agent listens through a laptop microphone, understands callers, handles normal business conversations, checks Google Calendar availability, books appointments, saves leads to Google Sheets, and speaks responses through the laptop speakers.
+A real-time local-microphone AI receptionist built with Pipecat 1.10 and LangGraph. It supports natural voice conversation, grounded Agentix company answers, persistent caller memory, Google Calendar booking, Google Sheets lead capture, and sanitized execution tracing.
 
-## Features
+## Current capabilities
 
-- Real-time microphone and speaker conversation
-- Deepgram Flux speech-to-text
-- Silero voice activity detection
-- Groq-powered conversational reasoning
-- Deepgram text-to-speech
-- Natural interruption and barge-in support
-- Stateful LangGraph appointment workflow
-- Google Calendar availability and event creation
-- Final availability re-check before booking
-- Google Sheets lead capture
-- Progressive slot discovery by morning, afternoon, or evening
-- Stable LangGraph `thread_id` throughout a caller session
-- Duplicate booking and duplicate lead-write protection
-- Natural spoken responses for every workflow state
+- Laptop microphone and speaker conversation through `LocalAudioTransport`
+- Deepgram Flux speech-to-text and Deepgram Aura text-to-speech
+- Silero voice activity detection with interruption and barge-in
+- Groq `openai/gpt-oss-120b` conversational reasoning
+- Hybrid Agentix knowledge retrieval using dense and sparse vectors in Qdrant
+- Closed-world grounding for company facts and service offerings
+- Persistent caller-specific memory through a local VoiceMem sidecar
+- Concurrent RAG and VoiceMem retrieval when both sources are relevant
+- Stateful LangGraph booking with interrupt/resume support
+- Real Calendar availability, final slot re-check, and event creation
+- Confirmed Sheets append with duplicate-write protection
+- Sanitized Pipecat metrics and interaction traces
 
-## Architecture
+## Runtime architecture
 
 ```mermaid
 flowchart LR
-    A[Microphone] --> B[LocalAudioTransport]
-    B --> C[Deepgram Flux STT]
-    C --> D[Silero VAD and Turn Handling]
-    D --> E[Groq LLM]
-    E --> F[LangGraph Booking Workflow]
-    F --> G[Google Calendar]
-    F --> H[Google Sheets]
-    F --> E
-    E --> I[Deepgram TTS]
-    I --> J[Speaker]
+    Mic[Microphone] --> AudioIn[LocalAudioTransport]
+    AudioIn --> STT[Deepgram Flux STT]
+    STT --> Turn[Silero VAD and turn handling]
+    Turn --> Transcript[Final caller transcript]
+    Transcript --> MemoryWrite[VoiceMem write filter]
+    Transcript --> Route[Deterministic retrieval routing]
+    Route --> RAG[Qdrant hybrid RAG]
+    Route --> MemoryRead[VoiceMem caller memory]
+    RAG --> Context[Temporary grounded context]
+    MemoryRead --> Context
+    Context --> LLM[Groq LLM]
+    LLM --> Normal[Normal response]
+    LLM --> Booking[LangGraph booking tool]
+    Booking --> Calendar[Google Calendar]
+    Booking --> Sheets[Google Sheets]
+    Calendar --> Booking
+    Sheets --> Booking
+    Booking --> Reply[Exact workflow response]
+    Normal --> TTS[Deepgram TTS]
+    Reply --> TTS
+    TTS --> Speaker[Speaker]
 ```
 
-LangGraph owns the complete booking workflow. Calendar and Sheets operations are not duplicated in the Pipecat layer.
+Retrieved RAG and VoiceMem content is temporary context for one LLM request; it is not appended permanently to conversation history. LangGraph exclusively owns booking actions, so Calendar and Sheets writes are not duplicated by Pipecat.
 
-## Technology Stack
+## Knowledge authority
+
+| Source | Authority |
+|---|---|
+| Current conversation | The caller's newest explicit facts and corrections |
+| VoiceMem | Caller history, preferences, workflow, needs, and prior facts |
+| Agentix RAG | Company facts, services, projects, technology, pricing, and policies |
+| General LLM knowledge | Conversation that is not a company or caller-history claim |
+
+Company questions are closed-world: a service is confirmed only when the knowledge base explicitly supports it. Caller-history questions use current conversation facts first and VoiceMem second. Missing caller details are not replaced with generic advice.
+
+## Technology stack
 
 | Component | Technology |
 |---|---|
-| Voice orchestration | Pipecat AI 1.10.0 |
-| Workflow orchestration | LangGraph |
-| Speech-to-text | Deepgram Flux |
-| Voice activity detection | Silero VAD |
-| Language model | Groq |
-| Text-to-speech | Deepgram |
-| Local audio | PyAudio / Pipecat LocalAudioTransport |
-| Scheduling | Google Calendar API |
-| Lead storage | Google Sheets API |
-| State persistence | LangGraph MemorySaver |
+| Voice pipeline | Pipecat AI 1.10.0 |
+| STT | Deepgram Flux `flux-general-en` |
+| VAD | Silero VAD |
+| LLM | Groq `openai/gpt-oss-120b` |
+| TTS | Deepgram `aura-2-thalia-en` |
+| Workflow | LangGraph with `MemorySaver` |
+| Dense retrieval | FastEmbed `BAAI/bge-small-en-v1.5` |
+| Sparse retrieval | FastEmbed/Qdrant BM25 with IDF |
+| Fusion | Qdrant reciprocal rank fusion |
+| Parsing/chunking | Docling `HybridChunker` |
+| Vector database | Qdrant at `http://localhost:6333` |
+| Caller memory | VoiceMem localhost sidecar |
+| Business systems | Google Calendar and Google Sheets APIs |
 
-## Project Structure
+## Repository layout
 
 ```text
-pipecat-project/
-├── main.py                         # Real-time Pipecat voice pipeline
-├── agent/
-│   ├── booking_session.py          # Pipecat-to-LangGraph session bridge
-│   └── graph.py                    # Stateful booking workflow
-├── prompts/
-│   └── receptionist.md             # Receptionist behavior and voice instructions
-├── services/
-│   ├── google_auth.py              # Shared Google OAuth authentication
-│   ├── google_calendar.py          # Availability and appointment operations
-│   └── google_sheets.py            # Lead persistence
-├── tests/
-│   ├── test_booking_session.py     # Offline workflow and state tests
-│   ├── test_booking_workflow.py    # Pipecat callback and completion tests
-│   └── test_calendar.py            # Standalone live Calendar test script
-├── credentials.json                # Local Google OAuth credentials; never commit
-├── token.json                      # Generated OAuth token; never commit
-└── .env                            # Local API keys; never commit
+pipecat-voice-agent/
+|-- main.py                         # Pipecat pipeline and booking tool bridge
+|-- trace_recorder.py               # Sanitized representative JSON trace
+|-- requirements.txt                # Voice-agent and RAG dependencies
+|-- .env.example                    # Safe environment template
+|-- agent/
+|   |-- booking_session.py          # Per-call LangGraph session bridge
+|   `-- graph.py                    # Booking graph and Google actions
+|-- knowledge/
+|   |-- agentix_rag_knowledge_base.md
+|   `-- agentix_pricing_benchmark_notes.md
+|-- memory/
+|   |-- caller_identity.py          # Stable local caller identity
+|   |-- voicemem_adapter.py         # Fail-open sidecar client
+|   |-- integration.py              # READ routing, WRITE filtering, context
+|   `-- orchestration.py            # Concurrent RAG/VoiceMem prefetch
+|-- prompts/
+|   `-- receptionist.md             # Receptionist and tool instructions
+|-- rag/
+|   |-- config.py                   # Models, collection, retrieval limits
+|   |-- models.py                   # Lazy dense and sparse models
+|   |-- index.py                    # Explicit Docling/Qdrant indexing
+|   |-- retrieve.py                 # Hybrid search and RRF fusion
+|   |-- integration.py              # Routing and grounded context
+|   |-- cli.py                      # Standalone retrieval CLI
+|   `-- evaluate.py                 # Retrieval evaluation set
+|-- services/
+|   |-- google_auth.py              # Shared Google OAuth
+|   |-- google_calendar.py          # Availability and events
+|   `-- google_sheets.py            # Verified lead append
+`-- tests/                           # Mocked regression suites
+```
+
+VoiceMem remains in its separate sibling repository:
+
+```text
+Pipecat/
+|-- pipecat-voice-agent/
+|-- .pipevenv/
+`-- voicemem-test/
+    |-- .vmvenv/
+    `-- VoiceMem/
+        `-- service/app.py
 ```
 
 ## Prerequisites
 
-- Windows with a working microphone and speakers or headphones
-- Python 3.11
-- A Deepgram API key
-- A Groq API key
-- A Google Cloud project
-- Google Calendar API enabled
-- Google Sheets API enabled
-- OAuth desktop application credentials from Google Cloud
-- A Google Sheet for lead storage
+- Windows and Python 3.11
+- Working microphone and speakers; headphones are recommended
+- Deepgram and Groq API keys
+- Docker or another Qdrant 1.x installation
+- Google Cloud project with Calendar and Sheets APIs enabled
+- Google OAuth desktop credentials and a Sheet with a `Sheet1` tab
+- Companion VoiceMem repository and its tested `.vmvenv` for persistent memory
 
-Headphones are recommended during development to minimize acoustic feedback from laptop speakers into the microphone.
+The agent remains usable if Qdrant or VoiceMem is unavailable. The affected retrieval path fails open while normal conversation and booking continue.
 
 ## Installation
 
-Create and activate a virtual environment from the `Pipecat` directory:
+From `D:\AI Internship\Pipecat`:
 
 ```powershell
 python -m venv .pipevenv
 & ".\.pipevenv\Scripts\Activate.ps1"
+pip install -r ".\pipecat-voice-agent\requirements.txt"
 ```
 
-Install the required packages:
+The project is pinned to Pipecat 1.10.0. Validate frame, turn, metrics, and service APIs before changing that version.
+
+## Environment configuration
 
 ```powershell
-pip install "pipecat-ai[deepgram,groq,local,silero]==1.10.0" `
-    langgraph `
-    python-dotenv `
-    loguru `
-    google-api-python-client `
-    google-auth `
-    google-auth-oauthlib
+cd "D:\AI Internship\Pipecat\pipecat-voice-agent"
+Copy-Item .env.example .env
 ```
 
-## Environment Configuration
+| Variable | Required | Purpose |
+|---|---:|---|
+| `GROQ_API_KEY` | Yes | Main LLM and VoiceMem extraction |
+| `DEEPGRAM_API_KEY` | Yes | Flux STT and Aura TTS |
+| `GOOGLE_SHEET_ID` | For lead saving | Destination spreadsheet |
+| `TEST_CALLER_ID` | Recommended locally | Stable caller memory namespace |
+| `VOICEMEM_SIDECAR_URL` | No | Defaults to `http://127.0.0.1:8765` |
+| `GOOGLE_CLIENT_ID` | Optional | External credential tooling only |
+| `GOOGLE_CLIENT_SECRET` | Optional | External credential tooling only |
 
-Create `.env` inside `pipecat-project`:
+Optional local additions:
 
 ```dotenv
-GROQ_API_KEY=your_groq_api_key
-DEEPGRAM_API_KEY=your_deepgram_api_key
-GOOGLE_SHEET_ID=your_google_spreadsheet_id
+TEST_CALLER_ID=terminal_live_001
+VOICEMEM_SIDECAR_URL=http://127.0.0.1:8765
 ```
 
-`GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` may also be retained in `.env` for other tooling, but this project authenticates through `credentials.json`.
+Never commit `.env`, OAuth files, private keys, local databases, Qdrant/VoiceMem storage, or traces.
 
-Never commit `.env`, `credentials.json`, or `token.json`.
+## Google setup
 
-## Google OAuth Setup
+1. Enable Google Calendar API and Google Sheets API.
+2. Configure the OAuth consent screen and permitted test account.
+3. Create OAuth credentials for a desktop application.
+4. Save the download as `credentials.json` in this project root.
+5. Start the agent and authorize it in the browser on first use.
 
-1. Create or select a project in Google Cloud Console.
-2. Enable the Google Calendar API and Google Sheets API.
-3. Configure the OAuth consent screen.
-4. Create OAuth credentials for a **Desktop app**.
-5. Download the credentials file and save it as:
-
-   ```text
-   pipecat-project/credentials.json
-   ```
-
-6. Add your Google account as a test user if the OAuth application is still in testing mode.
-7. Run the application from the project directory.
-8. Complete the browser authorization prompt on the first run.
-
-After authorization, the application creates `token.json`. Later runs reuse and refresh that token automatically.
-
-The configured OAuth scopes permit Calendar and Sheets access:
+The application creates `token.json` and reuses it. Both files are gitignored. Required scopes are:
 
 ```text
 https://www.googleapis.com/auth/calendar
 https://www.googleapis.com/auth/spreadsheets
 ```
 
-## Google Sheets Setup
-
-Create a spreadsheet and place its ID in `GOOGLE_SHEET_ID`. The default worksheet name is `Sheet1`.
-
-Lead records are appended in this column order:
+Leads are appended to `Sheet1!A:K`:
 
 | Column | Value |
 |---|---|
@@ -163,69 +198,152 @@ Lead records are appended in this column order:
 | D | Business |
 | E | Industry |
 | F | Problem |
-| G | Volume |
+| G | Lead volume |
 | H | Current system |
 | I | Interested service |
 | J | Meeting date |
 | K | Meeting time |
 
-## Running the Voice Agent
+Success is reported only when the Sheets API confirms one complete 11-column row.
 
-Run the application from `pipecat-project` so relative Google credential paths resolve correctly:
+## Start Qdrant and index the knowledge base
 
 ```powershell
-cd "D:\AI Internship\Pipecat\pipecat-project"
-& "..\.pipevenv\Scripts\python.exe" main.py
+docker run -d --name agentix-qdrant -p 6333:6333 `
+  -v agentix-qdrant-data:/qdrant/storage qdrant/qdrant
 ```
 
-Allow microphone access when Windows requests it. Speak normally after the application starts.
+For an existing container:
 
-Example booking conversation:
+```powershell
+docker start agentix-qdrant
+```
+
+Build or rebuild the index explicitly:
+
+```powershell
+cd "D:\AI Internship\Pipecat\pipecat-voice-agent"
+& "..\.pipevenv\Scripts\python.exe" -m rag.index
+```
+
+The indexer loads `knowledge/agentix_rag_knowledge_base.md` with Docling, chunks it with `HybridChunker`, creates dense BGE and sparse BM25 vectors, and stores both in `agentix_rag_knowledge`. Starting the voice agent does not re-index it.
+
+Test retrieval:
+
+```powershell
+& "..\.pipevenv\Scripts\python.exe" -m rag.cli
+& "..\.pipevenv\Scripts\python.exe" -m rag.cli "What is PongVerse?"
+& "..\.pipevenv\Scripts\python.exe" -m rag.evaluate
+```
+
+The retriever prefetches dense and sparse candidates, applies Qdrant RRF, and returns at most three chunks. The integration uses only the useful subset, preferring one strong chunk when sufficient.
+
+## Start VoiceMem
+
+VoiceMem runs separately to isolate its dependency stack. In another PowerShell window:
+
+```powershell
+cd "D:\AI Internship\Pipecat\voicemem-test\VoiceMem"
+$env:TEST_CALLER_ID="terminal_live_001"
+& "..\.vmvenv\Scripts\python.exe" -m uvicorn service.app:app `
+  --host 127.0.0.1 `
+  --port 8765 `
+  --env-file "..\..\pipecat-voice-agent\.env"
+```
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8765/health
+```
+
+The sidecar hashes caller IDs with SHA-256 and stores each caller in a separate namespace. New callers initialize dynamically, so changing the caller ID does not require restarting the sidecar.
+
+Live memory behavior:
+
+- Caller-history/profile/workflow questions trigger deterministic READ routing.
+- Useful self-disclosures are queued for non-blocking WRITE.
+- Recall questions, greetings, contact details, and transactional booking fields are not written.
+- Current conversation facts override older memories.
+- A caller-specific write failure does not disable other callers.
+
+## Run the voice agent
+
+```powershell
+cd "D:\AI Internship\Pipecat\pipecat-voice-agent"
+$env:TEST_CALLER_ID="terminal_live_001"
+& "..\.pipevenv\Scripts\python.exe" .\main.py
+```
+
+Use a different stable ID to test caller isolation:
+
+```powershell
+$env:TEST_CALLER_ID="terminal_live_002"
+& "..\.pipevenv\Scripts\python.exe" .\main.py
+```
+
+Concise diagnostics show routing without exposing internals to the caller:
 
 ```text
-Caller: I would like to book a meeting tomorrow.
-Assistant: What works better for you: morning, afternoon, or evening?
-Caller: Afternoon.
-Assistant: I have 2:00 PM, 2:30 PM, or 3:00 PM available. Which works best?
-Caller: 2:30 PM.
-Assistant: Great. Could I get your name and email to finalize the booking?
-Caller: My name is Alex and my email is alex@example.com.
-Assistant: You're all set. Your meeting is confirmed for tomorrow at 2:30 PM.
+Retrieval route: RAG
+RAG: 1 chunks | 18.50 ms
+Memory: skipped
 ```
 
-Only slots returned by Google Calendar are offered. The selected slot is checked again immediately before event creation.
+## Booking flow
 
-## Booking Workflow
+1. Groq calls `booking_workflow` for booking intent.
+2. LangGraph resolves or requests the date.
+3. Calendar returns real availability.
+4. The workflow resolves a concrete time or offers real alternatives.
+5. Name and email are collected after a valid slot is selected.
+6. Ambiguous spoken email requires confirmation on a later caller turn.
+7. The selected slot is checked again immediately before booking.
+8. Calendar creates the event exactly once.
+9. Sheets appends the lead exactly once.
+10. The confirmed date/time is proactively spoken through normal TTS.
 
-1. Detect a booking request.
-2. Collect or resolve the requested date.
-3. Fetch real Calendar availability.
-4. Ask for a time preference when many slots are available.
-5. Offer up to three real matching slots.
-6. Collect the caller's name and email.
-7. Re-check the selected slot.
-8. Create the Calendar appointment.
-9. Save the lead in Google Sheets.
-10. Proactively speak the confirmed date and time.
+The workflow preserves date/time across missing-field collection and protects both writes from repeated tool calls.
 
-LangGraph interruptions collect missing information across multiple voice turns. A stable session-specific `thread_id` allows the workflow to resume from the correct state.
+## Sanitized execution trace
+
+A completed booking writes:
+
+```text
+traces/representative_trace.json
+```
+
+The trace contains ordered timestamps, transcripts, retrieval decisions and latency, safe public RAG excerpts, exposed Pipecat metrics, tool results, Calendar/Sheets status and timing, errors/retries, and the final response.
+
+Before disk write, the recorder redacts configured secrets, names, emails, phone numbers, spreadsheet IDs, Calendar event IDs, OAuth data, headers, and caller/thread IDs. Unavailable metrics are `null`; `traces/` is gitignored.
 
 ## Tests
 
-Run the offline booking and Pipecat integration tests:
+Run the offline mocked suite without Groq, Deepgram, or Google API usage:
 
 ```powershell
-cd "D:\AI Internship\Pipecat\pipecat-project"
-& "..\.pipevenv\Scripts\python.exe" -m unittest discover -s tests -p "test_booking*.py" -v
+cd "D:\AI Internship\Pipecat\pipecat-voice-agent"
+& "..\.pipevenv\Scripts\python.exe" -m unittest `
+  tests.test_booking_conversation_e2e `
+  tests.test_booking_session `
+  tests.test_booking_workflow `
+  tests.test_google_sheets `
+  tests.test_memory_adapter `
+  tests.test_rag_integration `
+  tests.test_retrieval_orchestration `
+  tests.test_trace_recorder -v
 ```
 
-These tests mock external Calendar and Sheets writes. They cover state resumption, progressive slot filtering, final confirmation, stale-slot handling, duplicate protection, failure behavior, and Pipecat callback execution.
+Run sidecar tests separately:
 
-`tests/test_calendar.py` is a standalone live Google Calendar script. It requires valid credentials and network access and should not be included in the offline test command.
+```powershell
+cd "D:\AI Internship\Pipecat\voicemem-test\VoiceMem"
+& "..\.vmvenv\Scripts\python.exe" -m unittest service.test_app -v
+```
 
-## Scheduling Configuration
+`tests/test_calendar.py` is a standalone live Google Calendar script and is intentionally excluded from the offline command.
 
-Calendar behavior is configured in `services/google_calendar.py`:
+## Scheduling configuration
+
+`services/google_calendar.py` currently uses:
 
 ```python
 TIMEZONE = "Asia/Karachi"
@@ -235,55 +353,42 @@ APPOINTMENT_DURATION_MINUTES = 60
 SLOT_STEP_MINUTES = 30
 ```
 
-Update these constants to match the target business before deployment.
+Update these constants for the target business before deployment.
 
 ## Security
 
-The included `.gitignore` excludes:
-
-```gitignore
-.env
-credentials.json
-token.json
-```
-
-If any of these files were previously committed or pushed, remove them from Git tracking and rotate the exposed credentials.
+`.gitignore` excludes environment files, OAuth credentials, private keys, local databases, Qdrant storage, traces, caches, environments, and editor files. If a secret was committed, remove it from tracking and rotate it:
 
 ```powershell
 git rm --cached .env credentials.json token.json
 ```
 
-## Current Scope
+Do not commit VoiceMem's caller-data directory from the companion repository.
 
-- Designed for one local microphone caller session per process
-- Uses in-memory LangGraph checkpoints
-- Uses the primary Google Calendar
-- Uses the `Sheet1` worksheet for lead storage
-- Uses the `Asia/Karachi` timezone
-- Does not currently include telephony, Asterisk, RAG, or persistent database checkpoints
+## Current scope
+
+- One local microphone/speaker caller session per voice-agent process
+- Stable local caller identity through `TEST_CALLER_ID`
+- In-memory LangGraph checkpoints for the active process
+- Persistent VoiceMem namespaces in the sidecar
+- Primary Google Calendar, `Sheet1`, and `Asia/Karachi`
+- Local Qdrant for Agentix knowledge
+- No telephony, Asterisk, reranker, external embedding API, or persistent LangGraph database yet
 
 ## Troubleshooting
 
-**Imports cannot be resolved in VS Code**
+**VS Code import warnings:** select `D:\AI Internship\Pipecat\.pipevenv\Scripts\python.exe`.
 
-Select this interpreter:
+**RAG unavailable:** confirm Qdrant is reachable on port `6333`, the collection exists, and `rag.cli` returns results.
 
-```text
-D:\AI Internship\Pipecat\.pipevenv\Scripts\python.exe
-```
+**VoiceMem unavailable:** check `http://127.0.0.1:8765/health`, the sidecar `.env`, and the active `TEST_CALLER_ID`.
 
-**Google authorization fails**
+**Google authorization fails:** confirm both APIs, OAuth consent access, project-root `credentials.json`, and both required scopes.
 
-Confirm that `credentials.json` is present, both APIs are enabled, and your account is allowed by the OAuth consent screen.
+**No audio:** check Windows microphone permissions and default input/output devices.
 
-**No microphone or speaker audio**
-
-Check Windows privacy permissions and confirm that the expected input and output devices are configured as system defaults.
-
-**The assistant hears its own voice**
-
-Use headphones, reduce speaker volume, and verify that Windows audio enhancements or acoustic echo cancellation are enabled for the selected microphone device.
+**Speaker echo enters STT:** use headphones and verify Windows acoustic echo cancellation. Keep Pipecat turn/interruption handling enabled.
 
 ## License
 
-No license has been specified for this project. Add a license before public distribution.
+No project license is currently specified. Add one before public distribution.

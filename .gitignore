@@ -4,6 +4,16 @@
 !.env.example
 credentials.json
 token.json
+client_secret*.json
+service_account*.json
+service-account*.json
+oauth_token*.json
+google_token*.json
+secrets.json
+*.pem
+*.key
+*.p12
+*.pfx
 
 # Python caches and compiled files
 __pycache__/
@@ -20,9 +30,34 @@ env/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+.pytype/
+.pyre/
 .coverage
 .coverage.*
+coverage.xml
 htmlcov/
+test-results/
+junit.xml
+
+# Local model and tool caches
+.cache/
+.huggingface/
+.fastembed_cache/
+.docling/
+
+# Local databases and runtime state
+*.db
+*.sqlite
+*.sqlite3
+qdrant_storage/
+.qdrant/
+*.pid
+*.tmp
+*.temp
+*.bak
 
 # Packaging artifacts
 build/
@@ -36,3 +71,4 @@ traces/
 .vscode/
 .DS_Store
 Thumbs.db
+Desktop.ini

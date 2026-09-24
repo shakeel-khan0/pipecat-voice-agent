@@ -44,6 +44,8 @@ from pipecat.processors.aggregators.llm_response_universal import (
 from agent.booking_session import BookingSession
 from pipecat.adapters.schemas.direct_function import tool_options
 from rag.integration import RAGContextProcessor
+from memory.integration import VoiceMemContextProcessor, VoiceMemIngestProcessor
+from memory.orchestration import RetrievalPrefetchProcessor
 from trace_recorder import TraceMetricsObserver, trace_recorder
 
 
@@ -267,6 +269,9 @@ user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
 )
 
 rag_context = RAGContextProcessor()
+memory_context = VoiceMemContextProcessor()
+memory_ingest = VoiceMemIngestProcessor()
+retrieval_prefetch = RetrievalPrefetchProcessor(rag_context, memory_context)
 
 class LLMPrintProcessor(FrameProcessor):
     async def process_frame(self, frame: Frame, direction):
@@ -309,8 +314,11 @@ pipeline = Pipeline([
     transport.input(),
     stt,
     transcription_printer,
+    memory_ingest,
     user_aggregator,
+    retrieval_prefetch,
     rag_context,
+    memory_context,
     llm,
     LLMPrintProcessor(),
     tts,
